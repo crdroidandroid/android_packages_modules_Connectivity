@@ -869,9 +869,13 @@ public class OffloadControllerTest {
     public void testOnSetAlert() throws Exception {
         enableOffload();
         setOffloadPollInterval(DEFAULT_TETHER_OFFLOAD_POLL_INTERVAL_MS);
-        final OffloadController offload =
-                startOffloadController(OFFLOAD_HAL_VERSION_HIDL_1_0, true /*expectStart*/);
+        checkOnSetAlertCallback(OFFLOAD_HAL_VERSION_HIDL_1_0);
+        checkOnSetAlertCallback(OFFLOAD_HAL_VERSION_HIDL_1_1);
+    }
 
+    private void checkOnSetAlertCallback(int controlVersion) throws Exception {
+        final OffloadController offload =
+                startOffloadController(controlVersion, true /*expectStart*/);
         // Initialize with fake eth upstream.
         final String ethernetIface = "eth1";
         InOrder inOrder = inOrder(mHardware);
@@ -924,11 +928,7 @@ public class OffloadControllerTest {
         offload.setUpstreamLinkProperties(makeEthernetLinkProperties());
         mTetherStatsProvider.onSetAlert(0);
         waitForIdle();
-        if (controlVersion >= OFFLOAD_HAL_VERSION_HIDL_1_1) {
-            mTetherStatsProviderCb.assertNoCallback();
-        } else {
-            mTetherStatsProviderCb.expectNotifyAlertReached();
-        }
+        mTetherStatsProviderCb.expectNotifyAlertReached();
         verify(mHardware, never()).getForwardedStats(any());
     }
 

@@ -420,11 +420,6 @@ public class OffloadController {
 
         @Override
         public void onSetAlert(long quotaBytes) {
-            // Ignore set alert calls from HAL V1.1 since the hardware supports set warning now.
-            // Thus, the software polling mechanism is not needed.
-            if (!useStatsPolling()) {
-                return;
-            }
             // Post it to handler thread since it access remaining quota bytes.
             mHandler.post(() -> {
                 updateAlertQuota(quotaBytes);
@@ -509,15 +504,10 @@ public class OffloadController {
 
     private boolean isPollingStatsNeeded() {
         return started() && mRemainingAlertQuota > 0
-                && useStatsPolling()
                 && !TextUtils.isEmpty(currentUpstreamInterface())
                 && mDeps.getTetherConfig() != null
                 && mDeps.getTetherConfig().getOffloadPollInterval()
                 >= DEFAULT_TETHER_OFFLOAD_POLL_INTERVAL_MS;
-    }
-
-    private boolean useStatsPolling() {
-        return mOffloadHalVersion == OFFLOAD_HAL_VERSION_HIDL_1_0;
     }
 
     private boolean maybeUpdateDataWarningAndLimit(String iface) {
