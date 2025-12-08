@@ -116,6 +116,10 @@ apex {
     compat_configs: [
         "connectivity-platform-compat-config",
     ],
+    licenses: [
+        "Android-Apache-2.0",
+        "opensourcerequest",
+    ],
 }
 
 apex_key {
