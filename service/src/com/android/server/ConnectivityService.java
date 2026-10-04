@@ -13364,6 +13364,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
 
         if (!networkAgent.everConnected() && state == NetworkInfo.State.CONNECTED) {
             networkAgent.setConnected();
+            if (!networkAgent.isVPN()) {
+                updateAllowedUidsForNetwork(networkAgent);
+            }
 
             // NetworkCapabilities need to be set before sending the private DNS config to
             // NetworkMonitor, otherwise NetworkMonitor cannot determine if validation is required.
