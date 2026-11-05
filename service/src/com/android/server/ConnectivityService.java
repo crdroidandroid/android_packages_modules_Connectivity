@@ -2856,7 +2856,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
         }
 
         mRoutingCoordinatorService =
-                new RoutingCoordinatorService(netd, this::getAllNetworks, mContext,
+                new RoutingCoordinatorService(netd, this::getAllNetworksInternal, mContext,
                         mDeps.shouldBluetoothTetheringUseRandomAddress());
         mMulticastRoutingCoordinatorService =
                 mDeps.makeMulticastRoutingCoordinatorService(mHandler);
@@ -3208,6 +3208,34 @@ public class ConnectivityService extends IConnectivityManager.Stub
     }
 
     /**
+     * Whether the existence of the VPN represented by {@code nai} should be hidden from
+     * {@code uid}. VPNs are hidden from unprivileged apps that are neither routed through
+     * the VPN nor own it, so that such apps cannot tell that a VPN is active.
+     */
+    private boolean shouldHideVpnFromUid(@Nullable final NetworkAgentInfo nai, final int uid,
+            final boolean canSeeAllVpns) {
+        if (canSeeAllVpns || nai == null || !nai.isVPN()) return false;
+        if (UserHandle.getAppId(uid) < Process.FIRST_APPLICATION_UID) return false;
+        final NetworkCapabilities nc = nai.networkCapabilities;
+        return !nc.appliesToUid(uid) && nc.getOwnerUid() != uid;
+    }
+
+    /**
+     * Whether the caller is privileged enough to see all VPNs.
+     * Must not be called while holding mNetworkForNetId.
+     */
+    private boolean canSeeAllVpns(final int pid, final int uid) {
+        return hasSettingsPermission(pid, uid) || hasNetworkStackPermission(pid, uid);
+    }
+
+    /** Whether the VPN represented by {@code nai} should be hidden from the binder caller. */
+    private boolean shouldHideVpnFromCaller(@Nullable final NetworkAgentInfo nai) {
+        if (nai == null || !nai.isVPN()) return false;
+        final int uid = mDeps.getCallingUid();
+        return shouldHideVpnFromUid(nai, uid, canSeeAllVpns(mDeps.getCallingPid(), uid));
+    }
+
+    /**
      * Apply any relevant filters to the specified {@link NetworkInfo} for the given UID. For
      * example, this may mark the network as {@link DetailedState#BLOCKED} based
      * on {@link #isNetworkWithCapabilitiesBlocked}.
@@ -3325,7 +3353,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
             return null;
         }
         final NetworkAgentInfo nai = mLegacyTypeTracker.getNetworkForType(networkType);
-        if (nai == null) {
+        if (nai == null || shouldHideVpnFromCaller(nai)) {
             return makeFakeNetworkInfo(networkType, uid);
         }
         return filterNetworkInfo(nai.networkInfo, networkType, nai.networkCapabilities, uid,
@@ -3356,7 +3384,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
     public NetworkInfo getNetworkInfoForUid(Network network, int uid, boolean ignoreBlocked) {
         enforceAccessPermission();
         final NetworkAgentInfo nai = getNetworkAgentInfoForNetwork(network);
-        if (nai == null) return null;
+        if (nai == null || shouldHideVpnFromCaller(nai)) return null;
         return getFilteredNetworkInfo(nai, uid, ignoreBlocked);
     }
 
@@ -3389,6 +3417,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (isNetworkWithCapabilitiesBlocked(nai.networkCapabilities, uid, false)) {
             return null;
         }
+        if (shouldHideVpnFromCaller(nai)) {
+            return null;
+        }
         return nai.network;
     }
 
@@ -3396,6 +3427,27 @@ public class ConnectivityService extends IConnectivityManager.Stub
     @NonNull
     public Network[] getAllNetworks() {
         enforceAccessPermission();
+        final int uid = mDeps.getCallingUid();
+        // Evaluate permissions before taking the lock.
+        final boolean canSeeAllVpns = canSeeAllVpns(mDeps.getCallingPid(), uid);
+        synchronized (mNetworkForNetId) {
+            final ArrayList<Network> result = new ArrayList<>(mNetworkForNetId.size());
+            for (int i = 0; i < mNetworkForNetId.size(); i++) {
+                final NetworkAgentInfo nai = mNetworkForNetId.valueAt(i);
+                // Skip VPNs that the caller is neither routed through nor owns.
+                if (shouldHideVpnFromUid(nai, uid, canSeeAllVpns)) continue;
+                result.add(nai.network);
+            }
+            return result.toArray(new Network[0]);
+        }
+    }
+
+    /**
+     * Returns all networks without any per-caller filtering. For internal consumers
+     * (e.g. network stats, routing coordinator) that must always see every network.
+     */
+    @NonNull
+    private Network[] getAllNetworksInternal() {
         synchronized (mNetworkForNetId) {
             final Network[] result = new Network[mNetworkForNetId.size()];
             for (int i = 0; i < mNetworkForNetId.size(); i++) {
@@ -3616,7 +3668,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
     @Override
     public LinkProperties getLinkProperties(Network network) {
         enforceAccessPermission();
-        final LinkProperties lp = getLinkProperties(getNetworkAgentInfoForNetwork(network));
+        final NetworkAgentInfo nai = getNetworkAgentInfoForNetwork(network);
+        if (shouldHideVpnFromCaller(nai)) return null;
+        final LinkProperties lp = getLinkProperties(nai);
         if (lp == null) return null;
         return linkPropertiesRestrictedForCallerPermissions(
                 lp, Binder.getCallingPid(), mDeps.getCallingUid());
@@ -3661,6 +3715,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
             @Nullable String callingAttributionTag) {
         mAppOpsManager.checkPackage(mDeps.getCallingUid(), callingPackageName);
         enforceAccessPermission();
+        if (shouldHideVpnFromCaller(getNetworkAgentInfoForNetwork(network))) return null;
         return createWithSensitiveInfoSanitizedIfNecessaryWhenParceled(
                 getNetworkCapabilitiesInternal(network),
                 false /* includeLocationSensitiveInfo */,
@@ -3948,17 +4003,17 @@ public class ConnectivityService extends IConnectivityManager.Stub
         if (!hasSettingsPermission()) {
             // Unprivileged apps can only pass in null or their own UID.
             if (nc.getUids() == null) {
-                // If the caller passes in null, the callback will also match networks that do not
-                // apply to its UID, similarly to what it would see if it called getAllNetworks.
-                // In this case, redact everything in the request immediately. This ensures that the
-                // app is not able to get any redacted information by filing an unredacted request
-                // and observing whether the request matches something.
+                // Redact everything in the request immediately. This ensures that the app is not
+                // able to get any redacted information by filing an unredacted request and
+                // observing whether the request matches something.
                 if (nc.getNetworkSpecifier() != null) {
                     nc.setNetworkSpecifier(nc.getNetworkSpecifier().redact());
                 }
-            } else {
-                nc.setSingleUid(callerUid);
             }
+            // Always restrict to the caller's own UID (even if it passed null, e.g. via
+            // NetworkRequest.Builder#setIncludeOtherUidNetworks), so that callbacks never
+            // match VPNs the app is not routed through.
+            nc.setSingleUid(callerUid);
         }
         nc.setRequestorUidAndPackageName(callerUid, callerPackageName);
         nc.setAdministratorUids(new int[0]);
@@ -4038,7 +4093,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
         enforceNetworkStackOrSettingsPermission();
 
         final ArrayList<NetworkStateSnapshot> result = new ArrayList<>();
-        for (Network network : getAllNetworks()) {
+        for (Network network : getAllNetworksInternal()) {
             final NetworkAgentInfo nai = getNetworkAgentInfoForNetwork(network);
             final boolean includeNetwork = (nai != null) && nai.isCreated();
             if (includeNetwork) {
